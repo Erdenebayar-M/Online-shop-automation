@@ -1,56 +1,76 @@
-import jwt from "jsonwebtoken";
 import { Request, Response } from "express";
 import { supabaseAdmin } from "./supabase";
 
-const JWT_SECRET = process.env.JWT_SECRET || "secret";
+export type AuthUser = {
+  id: string;
+  email?: string | null;
+};
 
-export interface AuthPayload {
-  user_id: string;
-  role: string;
-  shop_id?: string;
-}
-
-export function signToken(payload: AuthPayload): string {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
-}
-
-export function verifyToken(token: string): AuthPayload | null {
-  try {
-    return jwt.verify(token, JWT_SECRET) as AuthPayload;
-  } catch {
-    return null;
-  }
-}
-
-export async function requireAuth(
-  req: Request,
-  res: Response
-): Promise<AuthPayload | null> {
+export async function getUserFromHeader(
+  req: Request
+): Promise<AuthUser | null> {
   const header = (req.headers.authorization || "") as string;
   const token = header.replace(/^Bearer\s+/, "");
-  if (!token) {
+  if (!token) return null;
+
+  // supabaseAdmin.auth.getUser expects a valid access token
+  const { data, error } = await supabaseAdmin.auth.getUser(token);
+  if (error || !data?.user) return null;
+  return { id: data.user.id, email: data.user.email ?? null };
+}
+
+export async function requireUser(
+  req: Request,
+  res: Response
+): Promise<AuthUser | null> {
+  const u = await getUserFromHeader(req);
+  if (!u) {
     res.status(401).json({ error: "Unauthorized" });
     return null;
   }
-  const decoded = verifyToken(token);
-  if (!decoded) {
-    res.status(401).json({ error: "Invalid token" });
-    return null;
-  }
-  return decoded;
+  return u;
 }
 
-export async function assertShopOwner(
-  decoded: AuthPayload,
-  shop_id: string
-): Promise<boolean> {
-  if (decoded.role === "admin") return true;
-  if (decoded.role === "owner" && decoded.shop_id === shop_id) return true;
+/**
+ * Check whether authUser is member (has a role) for the shop.
+ * Returns the membership row or null.
+ */
+export async function getMembership(authUserId: string, shopId: string | null) {
+  if (!shopId) return null;
   const { data, error } = await supabaseAdmin
-    .from("shops")
-    .select("owner_user_id")
-    .eq("id", shop_id)
+    .from("platform_customers")
+    .select("*")
+    .eq("id", authUserId)
+    .eq("shop_id", shopId)
+    .limit(1)
     .single();
-  if (error || !data) return false;
-  return data.owner_user_id === decoded.user_id;
+
+  if (error || !data) return null;
+  return data; // contains role, shop_id, id
+}
+
+/**
+ * Enforce role(s) for shop-scoped action. Returns membership row or responds 403.
+ */
+export async function requireRoleForShop(
+  req: Request,
+  res: Response,
+  roles: string[] = [],
+  shopId?: string
+) {
+  const user = await requireUser(req, res);
+  if (!user) return null;
+  const membership = await getMembership(
+    user.id,
+    shopId ?? (req.body.shop_id || req.query.shop_id)
+  );
+  if (!membership) {
+    res.status(403).json({ error: "Not a member of this shop" });
+    return null;
+  }
+  if (roles.length && !roles.includes(membership.role)) {
+    res.status(403).json({ error: "Insufficient role" });
+    return null;
+  }
+  return { user, membership };
 }

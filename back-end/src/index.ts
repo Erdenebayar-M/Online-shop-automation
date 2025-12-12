@@ -1,22 +1,23 @@
 import express from "express";
 import cors from "cors";
+import dotenv from "dotenv";
+dotenv.config();
 
+import { shopsRouter } from "./routes/shops";
 import { productsRouter } from "./routes/products";
 import { reservationsRouter } from "./routes/reservations";
-import { paymentRouter } from "./routes/payment";
-import { customersRouter } from "./routes/customers";
-import { mapPageRouter } from "./routes/mapPage";
+import { ordersRouter } from "./routes/orders";
+import { platformCustomersRouter } from "./routes/platform_customers";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+app.use("/shops", shopsRouter);
 app.use("/products", productsRouter);
 app.use("/reservations", reservationsRouter);
-app.use("/payment", paymentRouter);
-app.use("/customers", customersRouter);
-app.use("/map-page", mapPageRouter);
+app.use("/orders", ordersRouter);
+app.use("/platform_customers", platformCustomersRouter);
 
-app.listen(process.env.PORT, () =>
-  console.log(`Server running on port ${process.env.PORT}`)
-);
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
