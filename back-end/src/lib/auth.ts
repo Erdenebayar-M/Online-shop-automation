@@ -1,4 +1,4 @@
-import { Request, Response } from "express";
+import { Request, Response, NextFunction } from "express";
 import { supabaseAdmin } from "./supabase";
 
 export type AuthUser = {
@@ -13,9 +13,9 @@ export async function getUserFromHeader(
   const token = header.replace(/^Bearer\s+/, "");
   if (!token) return null;
 
-  // supabaseAdmin.auth.getUser expects a valid access token
   const { data, error } = await supabaseAdmin.auth.getUser(token);
   if (error || !data?.user) return null;
+
   return { id: data.user.id, email: data.user.email ?? null };
 }
 
@@ -37,6 +37,7 @@ export async function requireUser(
  */
 export async function getMembership(authUserId: string, shopId: string | null) {
   if (!shopId) return null;
+
   const { data, error } = await supabaseAdmin
     .from("platform_customers")
     .select("*")
@@ -46,7 +47,7 @@ export async function getMembership(authUserId: string, shopId: string | null) {
     .single();
 
   if (error || !data) return null;
-  return data; // contains role, shop_id, id
+  return data;
 }
 
 /**
@@ -60,17 +61,41 @@ export async function requireRoleForShop(
 ) {
   const user = await requireUser(req, res);
   if (!user) return null;
-  const membership = await getMembership(
-    user.id,
-    shopId ?? (req.body.shop_id || req.query.shop_id)
-  );
+
+  const targetShopId =
+    shopId ?? (req.body.shop_id || req.query.shop_id) ?? null;
+  const membership = await getMembership(user.id, targetShopId);
+
   if (!membership) {
     res.status(403).json({ error: "Not a member of this shop" });
     return null;
   }
+
   if (roles.length && !roles.includes(membership.role)) {
     res.status(403).json({ error: "Insufficient role" });
     return null;
   }
+
+  return { user, membership };
+}
+
+/**
+ * Check if user is owner of the shop
+ */
+export async function requireShopOwner(
+  req: Request,
+  res: Response,
+  shopId: string
+) {
+  const user = await requireUser(req, res);
+  if (!user) return null;
+
+  const membership = await getMembership(user.id, shopId);
+
+  if (!membership || membership.role !== "owner") {
+    res.status(403).json({ error: "Only shop owner can perform this action" });
+    return null;
+  }
+
   return { user, membership };
 }

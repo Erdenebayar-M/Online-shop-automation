@@ -1,96 +1,166 @@
+// ==================== routes/reservations.ts ====================
 import { Router, Request, Response } from "express";
 import { supabaseAdmin } from "../lib/supabase";
+import { asyncHandler } from "../utils/errors";
+import { validate, checkReservationSchema } from "../utils/validation";
+import { tryReserveProduct } from "../services/inventory.service";
 
 export const reservationsRouter = Router();
 
 /**
  * POST /reservations/check
  * Body: { shop_id, product_id, user_identifier, holdMinutes }
- * Returns reservation info. Backend marks reservation active and increments reserved if available.
+ * Returns reservation info. Uses atomic database operation.
  */
-reservationsRouter.post("/check", async (req: Request, res: Response) => {
-  try {
-    const { shop_id, product_id, user_identifier, holdMinutes = 10 } = req.body;
-    if (!shop_id || !product_id || !user_identifier)
-      return res.status(400).json({ error: "Missing fields" });
+reservationsRouter.post(
+  "/check",
+  asyncHandler(async (req: Request, res: Response) => {
+    const validated = validate(checkReservationSchema, req.body);
 
-    // get product scoped to shop
-    const { data: product, error: pErr } = await supabaseAdmin
-      .from("products")
-      .select("*")
-      .eq("id", product_id)
-      .eq("shop_id", shop_id)
-      .single();
-    if (pErr || !product)
-      return res.status(404).json({ error: "Product not found" });
+    const result = await tryReserveProduct(
+      validated.shop_id,
+      validated.product_id,
+      validated.user_identifier,
+      validated.holdMinutes
+    );
 
-    const available =
-      (product.quantity_total || 0) - (product.quantity_reserved || 0);
-    if (available > 0) {
-      const expires_at = new Date(
-        Date.now() + holdMinutes * 60000
-      ).toISOString();
-      const { data: reservation, error: rErr } = await supabaseAdmin
-        .from("reservations")
-        .insert([
-          {
-            shop_id,
-            product_id,
-            user_identifier,
-            status: "active",
-            order_type: "normal",
-            expires_at,
-          },
-        ])
-        .select()
-        .single();
-      if (rErr) throw rErr;
+    if (!result.success) {
+      return res.json(result);
+    }
 
-      // increment reserved via RPC
-      await supabaseAdmin.rpc("increment_reserved", {
-        p: JSON.stringify({ product_id }),
-      });
-
+    if (result.type === "normal") {
       return res.json({
         available: true,
         type: "normal",
-        reservation_id: reservation.id,
-        expires_at,
+        reservation_id: result.reservation_id,
+        expires_at: result.expires_at,
       });
     }
 
-    // out of stock -> check preorder
-    if (product.preorder_enabled) {
-      const expected = new Date();
-      expected.setDate(
-        expected.getDate() + (product.preorder_estimate_days || 14)
-      );
-      const { data: reservation } = await supabaseAdmin
-        .from("reservations")
-        .insert([
-          {
-            shop_id,
-            product_id,
-            user_identifier,
-            status: "active",
-            order_type: "preorder",
-            expected_delivery_date: expected.toISOString(),
-          },
-        ])
-        .select()
-        .single();
+    if (result.type === "preorder") {
       return res.json({
         available: false,
         type: "preorder",
-        reservation_id: reservation.id,
-        expected_delivery_date: expected.toISOString(),
+        reservation_id: result.reservation_id,
+        expected_delivery_date: result.expected_delivery_date,
       });
     }
 
-    return res.json({ available: false, type: "unavailable" });
-  } catch (err: unknown) {
-    const e = err instanceof Error ? err : new Error("Unknown error");
-    console.error(e);
-    return res.status(500).json({ error: e.message });
-  }
-});
+    return res.json(result);
+  })
+);
+
+/**
+ * POST /reservations/cancel
+ * Body: { reservation_id }
+ * Cancel an active reservation and free up inventory
+ */
+reservationsRouter.post(
+  "/cancel",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { reservation_id } = req.body;
+
+    if (!reservation_id) {
+      return res.status(400).json({ error: "reservation_id is required" });
+    }
+
+    // Get reservation details
+    const { data: reservation, error: fetchError } = await supabaseAdmin
+      .from("reservations")
+      .select("*")
+      .eq("id", reservation_id)
+      .single();
+
+    if (fetchError || !reservation) {
+      return res.status(404).json({ error: "Reservation not found" });
+    }
+
+    if (reservation.status !== "active") {
+      return res.status(400).json({ error: "Reservation is not active" });
+    }
+
+    // Mark as cancelled
+    const { error: updateError } = await supabaseAdmin
+      .from("reservations")
+      .update({ status: "cancelled" })
+      .eq("id", reservation_id);
+
+    if (updateError) throw updateError;
+
+    // Free up inventory for normal orders
+    if (reservation.order_type === "normal") {
+      await supabaseAdmin.rpc("decrement_reserved", {
+        p: JSON.stringify({ product_id: reservation.product_id }),
+      });
+    }
+
+    return res.json({ success: true });
+  })
+);
+
+/**
+ * GET /reservations/list
+ * Query: ?shop_id=xxx&status=active
+ * List reservations for a shop
+ */
+reservationsRouter.get(
+  "/list",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { shop_id, status, user_identifier } = req.query;
+
+    if (!shop_id || typeof shop_id !== "string") {
+      return res.status(400).json({ error: "shop_id is required" });
+    }
+
+    let query = supabaseAdmin
+      .from("reservations")
+      .select(
+        `
+        *,
+        products(name, sku, price)
+      `
+      )
+      .eq("shop_id", shop_id)
+      .order("created_at", { ascending: false });
+
+    if (status && typeof status === "string") {
+      query = query.eq("status", status);
+    }
+
+    if (user_identifier && typeof user_identifier === "string") {
+      query = query.eq("user_identifier", user_identifier);
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    return res.json({ reservations: data });
+  })
+);
+
+/**
+ * GET /reservations/:reservationId
+ * Get reservation details
+ */
+reservationsRouter.get(
+  "/:reservationId",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { reservationId } = req.params;
+
+    const { data, error } = await supabaseAdmin
+      .from("reservations")
+      .select(
+        `
+        *,
+        products(name, sku, price, description)
+      `
+      )
+      .eq("id", reservationId)
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ reservation: data });
+  })
+);
